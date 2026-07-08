@@ -1,0 +1,7 @@
+[agent]
+; URL du serveur Django (VPS en prod, ou machine de dev)
+; En dev depuis le PC Windows vers Docker/WSL2 : http://localhost:8000
+server = http://localhost:8000
+
+; Token de l'agent, copié depuis l'admin Django (PrintAgent)
+token =

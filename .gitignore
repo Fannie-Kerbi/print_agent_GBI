@@ -1,0 +1,18 @@
+﻿# Artefacts PyInstaller
+build/
+dist/
+*.spec
+
+# Sortie Inno Setup
+installer/Output/
+
+# Binaires (régénérables / téléchargés)
+*.exe
+nssm.exe
+
+# Config avec vrai token (ne jamais committer)
+agent.ini
+
+# Python
+__pycache__/
+*.pyc
