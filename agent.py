@@ -40,6 +40,7 @@ from typing import Optional
 
 try:
     import win32con
+    import win32gui
     import win32print
     import win32ui
     from PIL import Image, ImageWin
@@ -62,6 +63,15 @@ NETWORK_RETRY_DELAY = 5
 # Timeout de la requête de poll : doit être > au long-poll serveur (30s) pour
 # laisser le serveur tenir la connexion ouverte. On met une marge.
 POLL_HTTP_TIMEOUT = 45
+
+# Délai entre deux étiquettes d'un même job (ex: étiquette double, ou
+# label_qty > 1) envoyées à la suite à la même imprimante. Sans ça, deux
+# StartDoc/EndDoc GDI trop rapprochés peuvent arriver avant que l'imprimante
+# thermique ait fini de faire avancer/couper l'étiquette précédente : le
+# contenu suivant se retrouve alors imprimé par-dessus, sur la même
+# étiquette physique, au lieu d'une nouvelle (repéré au tirage réel : 2
+# étiquettes superposées et illisibles au lieu de 2 étiquettes distinctes).
+PRINT_JOB_DELAY = 1.5
 
 
 def list_windows_printers() -> None:
@@ -94,7 +104,55 @@ def load_config(config_path: str) -> dict:
     return cfg
 
 
-def _print_image_gdi(image: "Image.Image", printer_name: str) -> None:
+def _dump_devmode(devmode) -> None:
+    for field in ("DeviceName", "FormName", "PaperSize", "PaperWidth", "PaperLength", "Orientation", "Fields"):
+        print(f"  {field}: {getattr(devmode, field, '<absent>')}")
+
+
+def print_devmode_info(printer_name: str) -> None:
+    """
+    Diagnostic : affiche le DEVMODE réellement utilisé pour cette
+    imprimante, avant et après DocumentProperties, plus la taille de zone
+    imprimable (HORZRES/VERTRES) qui en résulte. Sert à comprendre pourquoi
+    une étiquette sort mal formatée (mauvaise taille/forme/orientation)
+    sans avoir à deviner à l'aveugle à chaque essai.
+    """
+    if not HAS_WIN32PRINT:
+        print("pywin32 indisponible.")
+        return
+
+    handle = win32print.OpenPrinter(printer_name)
+    try:
+        devmode_before = win32print.GetPrinter(handle, 2)["pDevMode"]
+        print("--- DEVMODE (GetPrinter, AVANT DocumentProperties) ---")
+        _dump_devmode(devmode_before)
+
+        devmode_after = win32print.GetPrinter(handle, 2)["pDevMode"]
+        win32print.DocumentProperties(
+            0, handle, printer_name, devmode_after, devmode_after,
+            win32con.DM_OUT_BUFFER | win32con.DM_IN_BUFFER,
+        )
+        print("--- DEVMODE (APRÈS DocumentProperties IN+OUT) ---")
+        _dump_devmode(devmode_after)
+
+        raw_hdc = win32gui.CreateDC("WINSPOOL", printer_name, devmode_after)
+        dc = win32ui.CreateDCFromHandle(raw_hdc)
+        try:
+            width = dc.GetDeviceCaps(win32con.HORZRES)
+            height = dc.GetDeviceCaps(win32con.VERTRES)
+            print(f"--- DC résultant : HORZRES={width} VERTRES={height} ---")
+        finally:
+            dc.DeleteDC()
+    finally:
+        win32print.ClosePrinter(handle)
+
+
+def _print_image_gdi(
+    image: "Image.Image",
+    printer_name: str,
+    label_width_mm: float | None = None,
+    label_height_mm: float | None = None,
+) -> None:
     """
     Imprime une image PIL sur `printer_name` via le pilote Windows (GDI).
 
@@ -107,13 +165,78 @@ def _print_image_gdi(image: "Image.Image", printer_name: str) -> None:
     L'image est étirée pour remplir toute la zone imprimable déclarée par
     le pilote (HORZRES/VERTRES) : la taille physique réelle de l'étiquette
     est donc celle configurée dans les propriétés du pilote Windows (format
-    de papier/étiquette), pas dans ce code.
+    de papier/étiquette), pas dans ce code — sauf si `label_width_mm`/
+    `label_height_mm` sont fournis (cf. plus bas).
+
+    Important : on récupère explicitement le DEVMODE via DocumentProperties
+    (l'API derrière la boîte de dialogue "Options d'impression"/Printing
+    Preferences), PAS le DEVMODE par défaut implicite qu'utiliserait
+    win32ui.CreatePrinterDC() — celui-ci correspond au format machine
+    ("Options d'impression par défaut" dans Propriétés de l'imprimante),
+    qui ignore le format d'étiquette personnalisé (ex: USER 49x150mm) réglé
+    dans les préférences utilisateur. Sans ça, le pilote imprime sur un
+    format générique (souvent Lettre/A4), d'où rognage et découpe absente.
     """
     if not HAS_WIN32PRINT:
         raise RuntimeError("pywin32 indisponible (pywin32 non installé ?)")
 
-    dc = win32ui.CreateDC()
-    dc.CreatePrinterDC(printer_name)
+    handle = win32print.OpenPrinter(printer_name)
+    try:
+        # DocumentProperties a besoin d'un objet PyDEVMODE existant à
+        # remplir (pas None) : on part de celui de GetPrinter, et on lui
+        # demande de le mettre à jour EN PLACE (IN+OUT) avec les réglages
+        # courants (dont le format d'étiquette personnalisé utilisateur).
+        devmode = win32print.GetPrinter(handle, 2)["pDevMode"]
+        win32print.DocumentProperties(
+            0, handle, printer_name, devmode, devmode,
+            win32con.DM_OUT_BUFFER | win32con.DM_IN_BUFFER,
+        )
+
+        # Nos étiquettes sont toujours composées en PAYSAGE côté serveur
+        # (ex: 150mm × 48mm), quel que soit le format de MEDIA physique
+        # déclaré dans le pilote (souvent portrait, ex: 49mm × 150mm — la
+        # largeur du rouleau × la longueur de coupe). On force donc
+        # l'orientation à LANDSCAPE : GDI fait alors pivoter la zone
+        # imprimable de 90° pour nous (HORZRES/VERTRES échangés), exactement
+        # comme le fait un navigateur qui imprime un PDF paysage sur une
+        # imprimante configurée en portrait. Sans ça, l'image paysage est
+        # étirée dans un cadre portrait (déformation, mauvaise longueur
+        # coupée par le capteur de l'imprimante).
+        devmode.Orientation = win32con.DMORIENT_LANDSCAPE
+        fields_to_set = win32con.DM_ORIENTATION
+
+        # Les préférences d'impression Windows (format de papier
+        # personnalisé) sont enregistrées PAR COMPTE Windows : si ce service
+        # tourne sous un compte différent de celui où le pilote a été
+        # configuré manuellement (ex: LocalSystem), GetPrinter ci-dessus
+        # renvoie un format par défaut différent, voire sans rapport (repéré
+        # au tirage réel : étiquette imprimée à une taille incohérente, ex.
+        # 75mm au lieu de 150mm). Quand le serveur nous fournit la taille
+        # réelle de l'étiquette (admin Django, par imprimante), on la fixe
+        # donc explicitement ici plutôt que de compter sur un état hérité du
+        # compte appelant.
+        if label_width_mm and label_height_mm:
+            devmode.PaperWidth = round(label_width_mm * 10)
+            devmode.PaperLength = round(label_height_mm * 10)
+            fields_to_set |= win32con.DM_PAPERWIDTH | win32con.DM_PAPERLENGTH
+
+        # On réapplique DocumentProperties après modification pour que le
+        # pilote recalcule tout de façon cohérente (pas juste patcher les
+        # champs bruts) et on marque les champs modifiés comme "à jour".
+        devmode.Fields = devmode.Fields | fields_to_set
+        win32print.DocumentProperties(
+            0, handle, printer_name, devmode, devmode,
+            win32con.DM_OUT_BUFFER | win32con.DM_IN_BUFFER,
+        )
+    finally:
+        win32print.ClosePrinter(handle)
+
+    # win32gui.CreateDC accepte un DEVMODE explicite (contrairement à
+    # win32ui.CreateDC().CreatePrinterDC()) mais n'expose pas StartDoc/
+    # EndDoc (fonctions spouleur GDI, pas de simples appels gdi32) : on
+    # enveloppe donc le HDC brut avec win32ui pour récupérer ces méthodes.
+    raw_hdc = win32gui.CreateDC("WINSPOOL", printer_name, devmode)
+    dc = win32ui.CreateDCFromHandle(raw_hdc)
     try:
         dc.StartDoc("Etiquette")
         dc.StartPage()
@@ -158,8 +281,14 @@ def try_print(images: list, printers: list) -> tuple:
             continue
         try:
             logger.info("Impression sur '%s' (%s) — %d étiquette(s)", name, printer_name, len(images))
-            for image in images:
-                _print_image_gdi(image, printer_name)
+            for i, image in enumerate(images):
+                if i > 0:
+                    time.sleep(PRINT_JOB_DELAY)
+                _print_image_gdi(
+                    image, printer_name,
+                    label_width_mm=p.get("label_width_mm"),
+                    label_height_mm=p.get("label_height_mm"),
+                )
             logger.info("Imprimé sur %s", name)
             return True, name, ""
         except Exception as exc:
@@ -271,10 +400,20 @@ def main():
         metavar="NOM_WINDOWS",
         help="Nom Windows exact de l'imprimante pour --test-print-image (cf. --list-printers)",
     )
+    parser.add_argument(
+        "--devmode-info",
+        metavar="NOM_WINDOWS",
+        help="Diagnostic : affiche le format de papier/étiquette (DEVMODE) réellement "
+             "utilisé pour cette imprimante, puis quitte.",
+    )
     args = parser.parse_args()
 
     if args.list_printers:
         list_windows_printers()
+        sys.exit(0)
+
+    if args.devmode_info:
+        print_devmode_info(args.devmode_info)
         sys.exit(0)
 
     if args.test_print_image:
