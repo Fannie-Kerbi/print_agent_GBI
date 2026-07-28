@@ -4,7 +4,7 @@
 ; ═══════════════════════════════════════════════════════════════════════════
 
 #define AppName "PrintAgent"
-#define AppVersion "1.0.0"
+#define AppVersion "2.0.0"
 #define InstallDir "C:\Program Files\print_agent"
 #define ConfigDir "C:\ProgramData\PrintAgent"
 
@@ -30,15 +30,20 @@ SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64compatible
 
 [Files]
-; Les binaires vont dans le sous-dossier dist\ de l'installation
+; Le binaire va dans le sous-dossier dist\ de l'installation.
+; Plus de nssm.exe : l'agent tourne desormais via une tache planifiee
+; "a la connexion" de l'utilisateur Windows, pas un service LocalSystem
+; (les preferences d'impression/format de papier sont enregistrees PAR
+; COMPTE Windows ; un service LocalSystem herite d'un format par defaut
+; sans rapport avec celui configure manuellement sur le compte de l'utilisateur).
 Source: "printagent.exe"; DestDir: "{#InstallDir}\dist"; Flags: ignoreversion
-Source: "nssm.exe"; DestDir: "{#InstallDir}\dist"; Flags: ignoreversion
 
 [Code]
 { ─────────────────────────────────────────────────────────────────────────
   Pascal Script : logique custom de l'installeur.
-  On crée une page de saisie personnalisée (URL serveur + token), puis on
-  génère agent.ini et on installe le service NSSM à la fin.
+  On crée une page de saisie personnalisée (URL serveur + token + compte
+  Windows), on génère agent.ini, puis on crée une tâche planifiée qui lance
+  l'agent à la connexion de ce compte (au lieu d'un service Windows).
   ───────────────────────────────────────────────────────────────────────── }
 
 var
@@ -50,15 +55,21 @@ begin
   ConfigPage := CreateInputQueryPage(
     wpSelectDir,
     'Configuration de l''agent',
-    'Paramètres de connexion au serveur',
-    'Renseignez l''URL du serveur et le token de cet agent ' +
-    '(copié depuis l''administration Django).'
+    'Paramètres de connexion au serveur et compte d''exécution',
+    'Renseignez l''URL du serveur, le token de cet agent ' +
+    '(copié depuis l''administration Django) et le compte Windows ' +
+    'sous lequel l''agent doit s''exécuter (celui qui reste connecté ' +
+    'sur ce poste et dont le pilote d''imprimante est configuré).'
   );
   { Champ 0 : URL serveur, avec valeur par défaut }
   ConfigPage.Add('URL du serveur (ex: https://mon-serveur.fr) :', False);
   ConfigPage.Values[0] := 'http://localhost:8000';
-  { Champ 1 : token. Le 'True' masque la saisie (comme un mot de passe) }
+  { Champ 1 : token. }
   ConfigPage.Add('Token de l''agent :', False);
+  { Champ 2 : compte Windows (DOMAINE\utilisateur), prérempli avec le
+    compte qui exécute l'installeur (souvent le bon, à corriger si besoin) }
+  ConfigPage.Add('Compte Windows (DOMAINE\utilisateur) :', False);
+  ConfigPage.Values[2] := GetEnv('USERDOMAIN') + '\' + GetEnv('USERNAME');
 end;
 
 { Validation : on empêche d'avancer si un champ est vide }
@@ -75,6 +86,11 @@ begin
     else if Trim(ConfigPage.Values[1]) = '' then
     begin
       MsgBox('Le token est obligatoire.', mbError, MB_OK);
+      Result := False;
+    end
+    else if Trim(ConfigPage.Values[2]) = '' then
+    begin
+      MsgBox('Le compte Windows est obligatoire.', mbError, MB_OK);
       Result := False;
     end;
   end;
@@ -97,22 +113,41 @@ begin
   SaveStringToFile('{#ConfigDir}\agent.ini', ConfigContent, False);
 end;
 
-{ Exécute une commande NSSM et attend la fin }
-function RunNssm(Params: String): Boolean;
+{ Supprime un éventuel ancien service NSSM "PrintAgent" (installations
+  précédentes de cet installeur, avant le passage en tâche planifiée) }
+procedure RemoveLegacyService();
 var
   ResultCode: Integer;
 begin
-  Result := Exec(
-    ExpandConstant('{#InstallDir}\dist\nssm.exe'),
-    Params,
-    '',
-    SW_HIDE,
-    ewWaitUntilTerminated,
-    ResultCode
-  );
+  Exec(ExpandConstant('{sys}\sc.exe'), 'stop {#AppName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(1000);
+  Exec(ExpandConstant('{sys}\sc.exe'), 'delete {#AppName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
-{ Après l'installation des fichiers : config + service }
+{ Crée la tâche planifiée "à la connexion" pour le compte Windows saisi }
+procedure CreateLogonTask();
+var
+  ResultCode: Integer;
+  TaskRun: String;
+  Params: String;
+begin
+  { Supprime une tâche existante du même nom avant de la recréer (idempotent) }
+  Exec(ExpandConstant('{sys}\schtasks.exe'), '/Delete /TN "{#AppName}" /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  TaskRun := '\"' + ExpandConstant('{#InstallDir}\dist\printagent.exe') + '\" --config \"' +
+    ExpandConstant('{#ConfigDir}\agent.ini') + '\"';
+
+  { /SC ONLOGON + /IT (interactive token) : la tâche tourne dans la session
+    interactive du compte donné dès qu'il se connecte, sans mot de passe
+    stocké (contrairement à un service, elle hérite donc de ses préférences
+    d'impression/pilote configurées manuellement sur ce compte). }
+  Params := '/Create /TN "{#AppName}" /TR "' + TaskRun + '" /SC ONLOGON /RU "' +
+    Trim(ConfigPage.Values[2]) + '" /IT /RL HIGHEST /F';
+
+  Exec(ExpandConstant('{sys}\schtasks.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+{ Après l'installation des fichiers : config + tâche planifiée }
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
@@ -124,44 +159,36 @@ begin
     if not DirExists('{#ConfigDir}\logs') then
       CreateDir('{#ConfigDir}\logs');
 
-    { 3. Installer le service NSSM (mêmes commandes qu'en manuel) }
-    RunNssm('install {#AppName} "{#InstallDir}\dist\printagent.exe"');
-    RunNssm('set {#AppName} AppParameters "--config {#ConfigDir}\agent.ini"');
-    RunNssm('set {#AppName} AppDirectory "{#InstallDir}\dist"');
-    RunNssm('set {#AppName} Start SERVICE_AUTO_START');
-    RunNssm('set {#AppName} Description "Agent d''impression d''etiquettes"');
-    RunNssm('set {#AppName} AppExit Default Restart');
-    RunNssm('set {#AppName} AppStdout "{#ConfigDir}\logs\agent.log"');
-    RunNssm('set {#AppName} AppStderr "{#ConfigDir}\logs\agent.log"');
-    RunNssm('set {#AppName} AppRotateFiles 1');
-    RunNssm('set {#AppName} AppRotateBytes 1048576');
+    { 3. Retirer un éventuel ancien service (mise à jour depuis l'ancienne
+      version de l'installeur qui utilisait NSSM) }
+    RemoveLegacyService();
 
-    { 4. Démarrer le service }
-    RunNssm('start {#AppName}');
+    { 4. Créer la tâche planifiée "à la connexion" }
+    CreateLogonTask();
+
+    MsgBox(
+      'Installation terminée. L''agent démarrera automatiquement à la ' +
+      'prochaine connexion du compte ' + Trim(ConfigPage.Values[2]) + '.' + #13#10 +
+      'Pour le démarrer immédiatement sans redémarrer la session, lance-le ' +
+      'manuellement depuis le Planificateur de tâches (tâche "PrintAgent").',
+      mbInformation, MB_OK
+    );
   end;
 end;
 
 { ─── DÉSINSTALLATION ─────────────────────────────────────────────────────── }
 
-{ Avant de supprimer les fichiers : arrêter et retirer le service }
+{ Avant de supprimer les fichiers : retirer la tâche planifiée (et un
+  éventuel ancien service NSSM, si l'agent n'a jamais été mis à jour) }
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   ResultCode: Integer;
-  TempNssm: String;
 begin
   if CurUninstallStep = usUninstall then
   begin
-    { On copie nssm.exe dans un dossier temporaire pour l'utiliser SANS
-      verrouiller celui du dossier d'installation (qu'on veut supprimer). }
-    TempNssm := ExpandConstant('{tmp}\nssm.exe');
-    FileCopy(ExpandConstant('{#InstallDir}\dist\nssm.exe'), TempNssm, False);
-
-    { Arrêter le service et attendre qu'il soit vraiment stoppé }
-    Exec(TempNssm, 'stop {#AppName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-    Sleep(2000);
-
-    { Supprimer le service (via la copie temporaire de nssm) }
-    Exec(TempNssm, 'remove {#AppName} confirm', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec(ExpandConstant('{sys}\schtasks.exe'), '/Delete /TN "{#AppName}" /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec(ExpandConstant('{sys}\sc.exe'), 'stop {#AppName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     Sleep(1000);
+    Exec(ExpandConstant('{sys}\sc.exe'), 'delete {#AppName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
 end;
